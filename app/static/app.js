@@ -9,6 +9,8 @@ const escapeHtml = (s) =>
 let currentVersion = null;
 let currentState = null;
 let lastPreview = null; // {token, version, result, input}
+let mappingPreview = null; // {token, version, resolved, ...}
+let mappingInputVersion = null; // 用户在网页上确认提交时所见的版本
 
 // --------------------------------------------------------------------------- //
 // 基础请求
@@ -64,6 +66,10 @@ $("tplRel").addEventListener("click", (e) => {
   e.preventDefault();
   downloadCsv("relatives_template.csv", "患者A,患者B\nP001,P002\n");
 });
+$("tplMapping").addEventListener("click", (e) => {
+  e.preventDefault();
+  downloadCsv("patient_mapping_template.csv", "旧患者号,规范患者号\nP001,P100\nP002,P100\n");
+});
 
 // --------------------------------------------------------------------------- //
 // 上传
@@ -94,6 +100,81 @@ async function uploadRelatives() {
     $("relFile").value = "";
     await refreshAll();
   } catch (err) { setMsg("relMsg", err.message); }
+}
+
+// --------------------------------------------------------------------------- //
+// 患者号更正（两步：预览 -> 按所见版本提交）
+// --------------------------------------------------------------------------- //
+async function previewMapping() {
+  const f = $("mappingFile").files[0];
+  if (!f) return setMsg("mappingMsg", "请先选择患者号更正 CSV 文件");
+  if (currentVersion === null) return setMsg("mappingMsg", "数据尚未加载完成，请稍后重试");
+  const fd = new FormData();
+  fd.append("file", f);
+  fd.append("expected_version", String(currentVersion));
+  mappingInputVersion = currentVersion;
+  setMsg("mappingMsg", "解析中…");
+  try {
+    const r = await api("/api/patient-mapping/preview", { method: "POST", body: fd });
+    mappingPreview = { ...r, token: r.preview_token, inputVersion: r.dataset_version };
+    $("mappingBaseVersion").textContent = "v" + r.dataset_version;
+    $("mapRowCount").textContent = r.resolved.length;
+    $("mappingTable").querySelector("tbody").innerHTML = r.resolved
+      .map((m) => `<tr>
+        <td>${escapeHtml(m.old_patient_id)}</td>
+        <td>${escapeHtml(m.canonical_patient_id)}</td></tr>`).join("");
+    const d = r.detail;
+    $("mappingStats").innerHTML = [
+      ["将改写患者号的病例", d.affected_case_count],
+      ["归并的旧号数", d.merged_patient_ids.length],
+      ["亲属对（前 → 后）", `${d.relatives_before} → ${d.relatives_after}`],
+      ["删除的自亲属 / 重复关系",
+        `${d.dropped_self_relatives.length} / ${d.dropped_duplicate_relatives.length}`],
+    ].map(([k, v]) => `<div class="card"><b>${v}</b><span>${k}</span></div>`).join("");
+    $("mapRelCount").textContent = r.relatives_after.length;
+    $("mappingRelTable").querySelector("tbody").innerHTML = r.relatives_after
+      .map((p) => `<tr><td>${escapeHtml(p.patient_a)}</td><td>${escapeHtml(p.patient_b)}</td></tr>`)
+      .join("");
+    $("mappingPreviewBox").classList.remove("hidden");
+    $("mappingCommitBtn").disabled = false;
+    $("mappingCommitMsg").textContent = "";
+    setMsg("mappingMsg", "预览已生成（未写入）；确认无误后点击下方提交。", true);
+  } catch (err) {
+    mappingPreview = null;
+    $("mappingPreviewBox").classList.add("hidden");
+    setMsg("mappingMsg", err.message);
+  }
+}
+
+async function commitMapping() {
+  if (!mappingPreview) return;
+  if (mappingInputVersion !== currentVersion) {
+    $("mappingCommitMsg").className = "msg err";
+    $("mappingCommitMsg").textContent =
+      `网页所见版本已从 v${mappingInputVersion} 变为 v${currentVersion}，预览失效，请重新预览。`;
+    $("mappingCommitBtn").disabled = true;
+    return;
+  }
+  const fd = new FormData();
+  fd.append("preview_token", mappingPreview.token);
+  fd.append("expected_version", String(mappingInputVersion));
+  setMsg("mappingCommitMsg", "提交中…");
+  try {
+    const r = await api("/api/patient-mapping/commit", { method: "POST", body: fd });
+    mappingPreview = null;
+    $("mappingPreviewBox").classList.add("hidden");
+    $("mappingFile").value = "";
+    setMsg("mappingMsg",
+      `身份更正已生效：v${r.previous_version} → v${r.dataset_version}，` +
+      `当前 ${r.patient_count} 位患者、${r.case_count} 个病例。旧预览与旧清单已永久失效。`, true);
+    await refreshAll();
+  } catch (err) {
+    setMsg("mappingCommitMsg", err.message);
+    if (/失效|变动/.test(String(err.message))) {
+      $("mappingCommitBtn").disabled = true;
+      await refreshAll();
+    }
+  }
 }
 
 // --------------------------------------------------------------------------- //
@@ -375,12 +456,20 @@ async function downloadManifest(id) {
 // --------------------------------------------------------------------------- //
 // 版本日志
 // --------------------------------------------------------------------------- //
+const CHANGE_TYPE_LABELS = {
+  upload_cases: "上传病例",
+  upload_relatives: "上传亲属对",
+  update_quotas: "保存配额",
+  update_locks: "保存锁定",
+  merge_patient_ids: "患者号更正（归并）",
+};
+
 async function loadVersionLog() {
   try {
     const r = await api("/api/version-log");
     $("logTable").querySelector("tbody").innerHTML = r.log.map((e) => `<tr>
       <td>v${e.dataset_version}</td>
-      <td>${escapeHtml(e.change_type)}</td>
+      <td>${escapeHtml(CHANGE_TYPE_LABELS[e.change_type] || e.change_type)}</td>
       <td><code>${escapeHtml(JSON.stringify(e.detail))}</code></td>
       <td>${escapeHtml(e.created_at)}</td></tr>`).join("")
       || `<tr><td colspan="4" class="hint">暂无变动记录</td></tr>`;
@@ -404,6 +493,13 @@ async function refreshAll(showStaleBanner = false) {
         $("previewWarn").classList.remove("hidden");
         $("publishBtn").disabled = true;
       }
+    }
+    if (mappingPreview && mappingPreview.inputVersion !== currentVersion) {
+      $("mappingCommitBtn").disabled = true;
+      $("mappingCommitMsg").className = "msg err";
+      $("mappingCommitMsg").textContent =
+        `输入版本已从 v${mappingPreview.inputVersion} 变为 v${currentVersion}，` +
+        "该身份更正预览已永久失效，请重新预览。";
     }
     if (lastPreview) renderSolveResult();
   } catch (err) {

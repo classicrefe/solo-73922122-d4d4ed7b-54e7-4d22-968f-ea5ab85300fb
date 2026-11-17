@@ -7,14 +7,15 @@ import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .db import Database, StaleVersionError
+from .identity import apply_patient_mapping, parse_mapping_csv
 from .models import (
     ActiveInput,
     ValidationError,
@@ -42,6 +43,48 @@ db = Database(str(DB_PATH))
 _PREVIEW_MAX = 64
 _previews: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
 _preview_lock = threading.Lock()
+
+# 患者号更正预览：与求解预览一样仅存内存，并绑定预览时的输入版本。
+# 版本一旦变动（包括提交归并本身），令牌即失效，必须重新上传预览。
+_mapping_previews: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+
+
+def _add_mapping_preview(version: int, preview: dict) -> str:
+    token = uuid.uuid4().hex
+    with _preview_lock:
+        _mapping_previews[token] = {"version": version, "preview": preview}
+        _mapping_previews.move_to_end(token)
+        while len(_mapping_previews) > _PREVIEW_MAX:
+            _mapping_previews.popitem(last=False)
+    return token
+
+
+def _get_mapping_preview(token: str, expected_version: int) -> Dict[str, Any]:
+    with _preview_lock:
+        preview = _mapping_previews.get(token)
+        if preview is None:
+            raise StaleVersionError(
+                "该身份更正预览不存在或已因重启/过期被清除，请重新上传 CSV 预览。"
+            )
+        current_version = db.get_version()
+        if preview["version"] != expected_version or expected_version != current_version:
+            raise StaleVersionError(
+                f"身份更正预览依据的输入版本 v{preview['version']} 或网页所见版本"
+                f" v{expected_version} 已变动为 v{current_version}，"
+                "该预览已永久失效，本次未写入任何数据，请刷新并重新预览。"
+            )
+        return preview["preview"]
+
+
+def _consume_mapping_preview(token: str, new_version: int) -> None:
+    """身份更正成功后立即清理旧令牌：该更正预览被消费，其余绑定旧版本的预览
+    也一并移除，保证旧令牌永久失效（数据库版本核对是第二道防线）。"""
+    with _preview_lock:
+        _mapping_previews.pop(token, None)
+        for key in [k for k, v in _mapping_previews.items() if v["version"] != new_version]:
+            _mapping_previews.pop(key, None)
+        for key in [k for k, v in _previews.items() if v["version"] != new_version]:
+            _previews.pop(key, None)
 
 
 def _add_preview(version: int, input_json: dict, result: dict) -> str:
@@ -160,6 +203,99 @@ async def upload_relatives(file: UploadFile = File(...)):
     relatives = parse_relatives_csv(raw, [c.patient_id for c in active.cases])
     new_version = db.replace_relatives(relatives)
     return {"dataset_version": new_version, "pair_count": len(relatives)}
+
+
+# --------------------------------------------------------------------------- #
+# 患者号更正（旧号 -> 规范号 归并）
+# 两步式：先预览（返回绑定输入版本的预览令牌），再按网页所见版本提交。
+# 预览不改动任何数据；提交时在同一个 IMMEDIATE 事务内核对版本、应用映射、
+# 递增版本并使旧清单失效——过期或失败时现行状态完全不变。
+# --------------------------------------------------------------------------- #
+@app.post("/api/patient-mapping/preview")
+async def preview_patient_mapping(
+    file: UploadFile = File(...),
+    expected_version: int = Form(...),
+):
+    raw = await _read_upload(file)
+    current_version, active = db.get_state()
+    if not active.cases:
+        raise ValidationError(["还没有病例数据，无法做患者号更正。"])
+    if expected_version != current_version:
+        raise StaleVersionError(
+            f"网页所见输入版本 v{expected_version} 已变为 v{current_version}，"
+            "请刷新后再上传更正表。"
+        )
+    rows = parse_mapping_csv(raw)
+    mapping, new_input, detail = apply_patient_mapping(active, rows)
+    preview = {
+        "input_version": expected_version,
+        "mapping_rows": [(old, new) for old, new in mapping.rows],
+        "mapping_row_count": len(mapping.rows),
+        "resolved": [
+            {
+                "old_patient_id": old,
+                "canonical_patient_id": mapping.resolved[old],
+            }
+            for old in sorted(mapping.resolved)
+        ],
+        "detail": detail,
+        "relatives_after": [
+            {"patient_a": r.patient_a, "patient_b": r.patient_b}
+            for r in new_input.relatives
+        ],
+        "cases_after": [
+            {"case_id": c.case_id, "patient_id": c.patient_id, "label": c.label}
+            for c in new_input.cases
+        ],
+    }
+    token = _add_mapping_preview(expected_version, preview)
+    return {
+        "preview_token": token,
+        "dataset_version": expected_version,
+        "mapping_rows": [
+            {"old_patient_id": old, "canonical_patient_id": new}
+            for old, new in preview["mapping_rows"]
+        ],
+        "mapping_row_count": preview["mapping_row_count"],
+        "resolved": preview["resolved"],
+        "detail": preview["detail"],
+        "relatives_after": preview["relatives_after"],
+        "cases_after": preview["cases_after"],
+    }
+
+
+@app.post("/api/patient-mapping/commit")
+async def commit_patient_mapping(
+    preview_token: str = Form(...),
+    expected_version: int = Form(...),
+):
+    preview = _get_mapping_preview(preview_token, expected_version)
+    # 完整映射链在事务内重新解析（以现行数据为准），版本核对不通过则整体回滚
+    try:
+        new_version, detail = db.apply_patient_mapping(
+            preview["mapping_rows"], expected_version
+        )
+    except (StaleVersionError, ValidationError):
+        # 版本过期 -> 409；映射在事务内复核失败 -> 400；两者均已整体回滚
+        raise
+    except Exception as exc:  # 写入失败：事务已回滚，现行状态未变
+        raise HTTPException(
+            status_code=500,
+            detail=f"身份更正写入失败，已整体回滚，现行状态未变：{exc}",
+        )
+    _consume_mapping_preview(preview_token, new_version)
+    _, active = db.get_state()
+    return {
+        "dataset_version": new_version,
+        "previous_version": expected_version,
+        "detail": detail,
+        "case_count": len(active.cases),
+        "patient_count": len({c.patient_id for c in active.cases}),
+        "relatives": [
+            {"patient_a": r.patient_a, "patient_b": r.patient_b}
+            for r in active.relatives
+        ],
+    }
 
 
 @app.put("/api/quotas")

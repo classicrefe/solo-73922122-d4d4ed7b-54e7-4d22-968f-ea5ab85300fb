@@ -32,6 +32,21 @@ REL_HEADER_ALIASES = {
     "patient_b": "patient_b",
 }
 
+MAPPING_HEADER_ALIASES = {
+    "旧患者号": "old_patient_id",
+    "旧号": "old_patient_id",
+    "原患者号": "old_patient_id",
+    "old_patient_id": "old_patient_id",
+    "old_patient": "old_patient_id",
+    "规范患者号": "canonical_patient_id",
+    "规范号": "canonical_patient_id",
+    "新患者号": "canonical_patient_id",
+    "canonical_patient_id": "canonical_patient_id",
+    "canonical_patient": "canonical_patient_id",
+}
+
+MAX_MAPPING_ROWS = 1000
+
 
 class ValidationError(Exception):
     def __init__(self, errors: List[str]):

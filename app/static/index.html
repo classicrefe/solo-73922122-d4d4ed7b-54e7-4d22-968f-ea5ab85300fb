@@ -49,6 +49,49 @@
     <span id="relMsg" class="msg"></span>
   </div>
 
+  <h2>3. 患者号更正（旧号归并到规范号）</h2>
+  <p class="hint">列：<code>旧患者号, 规范患者号</code>（至多 1000 行，UTF-8 或 GB18030）。
+    把同一患者的旧号归并到规范号，
+    避免其病例被分进不同数据集；多个旧号可归到同一规范号，映射支持链式传递
+    （A→B、B→C 时 A、B 均归并为 C）。
+    <a href="#" id="tplMapping">下载更正模板</a><br>
+    整批拒绝的情况：旧号不存在于当前病例、同一旧号指向不同规范号、映射成环（含自环）。
+    归并只改写患者号与亲属对（去除归并产生的自亲属及重复关系），
+    <b>病例号、标签、配额、锁定保持不变</b>。先预览，再按网页所见版本提交；
+    提交成功才递增版本并使旧预览与旧清单永久失效，过期或失败不改变任何现行状态。</p>
+  <div class="row">
+    <input type="file" id="mappingFile" accept=".csv,text/csv">
+    <button onclick="previewMapping()">上传并预览身份更正</button>
+    <span id="mappingMsg" class="msg"></span>
+  </div>
+  <div id="mappingPreviewBox" class="hidden">
+    <div class="banner warn">
+      以下为预览，尚未写入。<b>提交后输入版本将由 <span id="mappingBaseVersion">–</span>
+      递增</b>，旧预览与已发布清单将永久失效；即使新身份关系让原配额无解也照常保存，
+      后续求解会照实报告无解与冲突条件。
+    </div>
+    <h3>映射解析（共 <span id="mapRowCount">0</span> 行）</h3>
+    <div class="table-wrap">
+      <table id="mappingTable"><thead>
+        <tr><th>旧患者号</th><th>规范患者号（映射链终值）</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+    <h3>影响概览</h3>
+    <div id="mappingStats" class="grid4"></div>
+    <h3>归并后的亲属对（<span id="mapRelCount">0</span>）</h3>
+    <div class="table-wrap">
+      <table id="mappingRelTable"><thead>
+        <tr><th>患者 A</th><th>患者 B</th></tr>
+      </thead><tbody></tbody></table>
+    </div>
+    <div class="row">
+      <button class="primary" id="mappingCommitBtn" onclick="commitMapping()">
+        提交身份更正（版本 +1）
+      </button>
+      <span id="mappingCommitMsg" class="msg"></span>
+    </div>
+  </div>
+
   <h2>当前数据概览</h2>
   <div id="overview" class="grid4"></div>
   <h3>病例（<span id="caseCount">0</span>）</h3>

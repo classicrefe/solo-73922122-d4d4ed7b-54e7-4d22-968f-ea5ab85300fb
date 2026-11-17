@@ -18,6 +18,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from .identity import apply_patient_mapping as _apply_patient_mapping
 from .models import ActiveInput
 
 
@@ -149,7 +150,10 @@ class Database:
     # 写（每个方法一个 IMMEDIATE 事务；异常回滚，源数据不变）
     # ------------------------------------------------------------------ #
     def _commit_new_input(
-        self, new_input: ActiveInput, change_type: str, detail: Dict[str, Any]
+        self,
+        new_input: ActiveInput,
+        change_type: str,
+        detail: Dict[str, Any],
     ) -> int:
         with self._lock:
             try:
@@ -185,6 +189,59 @@ class Database:
                 )
                 self._conn.commit()
                 return new_version
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def apply_patient_mapping(
+        self, rows, expected_version: int
+    ) -> Tuple[int, Dict[str, Any]]:
+        """在当前事务内解析映射链并整体归并患者号。
+
+        版本核对、映射应用、版本递增、旧清单失效、版本日志在同一 IMMEDIATE
+        事务内完成；任何校验失败都会回滚，现行状态（含清单与预览依据）不变。
+        """
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT dataset_version, input_json FROM state WHERE id = 1"
+                ).fetchone()
+                if row["dataset_version"] != expected_version:
+                    raise StaleVersionError(
+                        f"网页所见输入版本 v{expected_version} 已变为"
+                        f" v{row['dataset_version']}，本次身份更正未写入，"
+                        "请刷新并重新预览。"
+                    )
+                current = ActiveInput.from_json(json.loads(row["input_json"]))
+                _, new_input, detail = _apply_patient_mapping(current, rows)
+                new_version = row["dataset_version"] + 1
+                self._conn.execute(
+                    "UPDATE state SET dataset_version = ?, input_json = ?, updated_at = ?"
+                    " WHERE id = 1",
+                    (
+                        new_version,
+                        json.dumps(new_input.to_json(), ensure_ascii=False),
+                        _now(),
+                    ),
+                )
+                self._conn.execute(
+                    "UPDATE published_manifests SET invalidated = 1, invalidated_at = ?"
+                    " WHERE invalidated = 0",
+                    (_now(),),
+                )
+                self._conn.execute(
+                    "INSERT INTO version_log (dataset_version, change_type, detail,"
+                    " created_at) VALUES (?, ?, ?, ?)",
+                    (
+                        new_version,
+                        "merge_patient_ids",
+                        json.dumps(detail, ensure_ascii=False),
+                        _now(),
+                    ),
+                )
+                self._conn.commit()
+                return new_version, detail
             except Exception:
                 self._conn.rollback()
                 raise
